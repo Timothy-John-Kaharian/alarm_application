@@ -1114,7 +1114,7 @@ class CalendarPlaceholderScreen extends StatelessWidget {
       bottom: false,
       child: Center(
         child: Text(
-          'Calendar view\nwill be added next.',
+          'Calendar \nwill be added next. \n Di pa maintindihan paano ito \n pati yung notification at background running',
           textAlign: TextAlign.center,
           style: TextStyle(
             fontSize: 18,
