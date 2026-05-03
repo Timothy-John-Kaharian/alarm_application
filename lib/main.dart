@@ -378,7 +378,6 @@ class AlarmNotificationService {
       FlutterLocalNotificationsPlugin();
   bool _isInitialized = false;
   static const MethodChannel _platform = MethodChannel('alarm_app/settings');
-  static const MethodChannel _nativeAlarm = MethodChannel('alarm_app/native_alarm');
 
   Future<void> initialize() async {
     if (_isInitialized) {
@@ -719,23 +718,8 @@ class AlarmNotificationService {
     );
   }
 
-  NotificationDetails _preAlarmNotificationDetails() {
-    // This is the notification channel for pre-alarm reminders.
-    return const NotificationDetails(
-      android: AndroidNotificationDetails(
-        'smart_alarm_reminder_channel',
-        'Alarm Reminders',
-        channelDescription: 'Reminders before alarms go off.',
-        importance: Importance.max,
-        priority: Priority.max,
-        playSound: true,
-        enableVibration: true,
-        fullScreenIntent: true,
-        audioAttributesUsage: AudioAttributesUsage.alarm,
-        category: AndroidNotificationCategory.reminder,
-      ),
-    );
-  }
+  // Pre-alarm notifications are scheduled via native code; details are
+  // constructed there. This helper removed because it's unused in Dart.
 }
 
 int _notificationIdForDay(int alarmId, int dayIndex, [int minutesBefore = 0]) {
@@ -950,23 +934,24 @@ class _AlarmShellState extends State<AlarmShell> {
         onTestAlarm: _testAlarm,
         onDebugPending: _showPendingNotifications,
         onSendImmediateTest: () async {
-          if (_alarms.isEmpty) {
-            if (!mounted) return;
-            await showDialog<void>(
-              context: context,
-              builder: (_) => AlertDialog(
-                title: const Text('No alarms'),
-                content: const Text('Create an alarm first to run a test.'),
-                actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
-              ),
-            );
-            return;
-          }
+                if (_alarms.isEmpty) {
+                  if (!mounted) return;
+                  await showDialog<void>(
+                    context: context,
+                    builder: (dialogContext) => AlertDialog(
+                      title: const Text('No alarms'),
+                      content: const Text('Create an alarm first to run a test.'),
+                      actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('OK'))],
+                    ),
+                  );
+                  return;
+                }
 
-          // Use the first alarm as a test target.
-          await AlarmNotificationService.instance.showImmediateTestNotification(_alarms.first);
-          if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Test notification sent')));
+                // Use the first alarm as a test target.
+                final messenger = ScaffoldMessenger.of(context);
+                await AlarmNotificationService.instance.showImmediateTestNotification(_alarms.first);
+                if (!mounted) return;
+                messenger.showSnackBar(const SnackBar(content: Text('Test notification sent')));
         },
       ),
       const CalendarPlaceholderScreen(),
@@ -1137,17 +1122,19 @@ class _TroubleshootScreenState extends State<TroubleshootScreen> {
               FilledButton(onPressed: _sendImmediateTest, child: const Text('Send Immediate Test Notification')),
               const SizedBox(height: 8),
               FilledButton(onPressed: () async {
+                final messenger = ScaffoldMessenger.of(context);
                 await AlarmNotificationService.instance.scheduleQuickZonedTest();
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Scheduled zoned test set for 10s')));
+                messenger.showSnackBar(const SnackBar(content: Text('Scheduled zoned test set for 10s')));
               }, child: const Text('Schedule Quick Zoned Test (10s)')),
               const SizedBox(height: 8),
               FilledButton(onPressed: () async {
+                final messenger = ScaffoldMessenger.of(context);
                 final id = 999903;
                 final scheduled = DateTime.now().add(const Duration(seconds: 10));
                 await AlarmNotificationService.instance.scheduleNativeAlarm(id, scheduled, 'Native Scheduled Test', 'native scheduled test', payload: 'native_test');
                 if (!mounted) return;
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Scheduled native alarm for 10s')));
+                messenger.showSnackBar(const SnackBar(content: Text('Scheduled native alarm for 10s')));
               }, child: const Text('Schedule Native Test (10s)')),
               const SizedBox(height: 16),
               if (_loading) const Center(child: CircularProgressIndicator()),
@@ -1281,7 +1268,7 @@ class AlarmListScreen extends StatelessWidget {
                         onTest: () => onTestAlarm(alarm),
                       );
                     },
-                    separatorBuilder: (_, __) => const SizedBox(height: 12),
+                    separatorBuilder: (context, index) => const SizedBox(height: 12),
                     itemCount: alarms.length,
                   ),
           ),
@@ -1698,6 +1685,7 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
       sound: _soundChoice,
     );
 
+    if (!mounted) return;
     Navigator.of(context).pop(alarm);
   }
 
@@ -1988,6 +1976,7 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
   }
 }
 
+// ignore: unused_element_parameter
 class _SectionCard extends StatelessWidget {
   const _SectionCard({super.key, this.title, required this.child});
 
