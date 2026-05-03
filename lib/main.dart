@@ -7,8 +7,56 @@ import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
 import 'package:timezone/data/latest_all.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+String? _queuedAlarmPayload;
+bool _isOpeningAlarmScreen = false;
+
+Future<void> _openAlarmScreenForPayload(String payload) async {
+  if (_isOpeningAlarmScreen) {
+    _queuedAlarmPayload = payload;
+    return;
+  }
+
+  final navigator = navigatorKey.currentState;
+  if (navigator == null || !navigator.mounted) {
+    _queuedAlarmPayload = payload;
+    return;
+  }
+
+  try {
+    final alarms = await AlarmStorage.instance.loadAlarms();
+    final matched = alarms.where((alarm) => alarm.id == payload).toList();
+    if (matched.isEmpty) {
+      return;
+    }
+
+    _isOpeningAlarmScreen = true;
+    await navigator.push(
+      MaterialPageRoute(
+        builder: (_) => AlarmRingingScreen(alarm: matched.first),
+      ),
+    );
+  } catch (error) {
+    debugPrint('Opening alarm screen failed: $error');
+    _queuedAlarmPayload = payload;
+  } finally {
+    _isOpeningAlarmScreen = false;
+  }
+}
+
+Future<void> _flushQueuedAlarmScreen() async {
+  final payload = _queuedAlarmPayload;
+  if (payload == null) {
+    return;
+  }
+
+  _queuedAlarmPayload = null;
+  await _openAlarmScreenForPayload(payload);
+}
 
 Future<void> main() async {
   // Initialize services before the UI starts.
@@ -23,6 +71,29 @@ Future<void> main() async {
     debugPrint('Alarm initialization failed: $error');
     debugPrintStack(stackTrace: stackTrace);
   });
+
+  // Also set up native alarm receive channel handler so native code can notify Flutter directly.
+  const receiveChannel = MethodChannel('alarm_app/receive');
+  receiveChannel.setMethodCallHandler((call) async {
+    if (call.method == 'alarmTrigger') {
+      final payload = call.arguments as String?;
+      if (payload != null) {
+        await _openAlarmScreenForPayload(payload);
+      }
+    }
+  });
+
+  // Ask native side if there was a pending alarm payload that arrived
+  // before Dart registered the receive handler (race on cold start).
+  try {
+    final settingsChannel = const MethodChannel('alarm_app/settings');
+    final pending = await settingsChannel.invokeMethod<String?>('fetchPendingAlarmPayload');
+    if (pending != null) {
+      _queuedAlarmPayload = pending;
+    }
+  } catch (e) {
+    debugPrint('fetchPendingAlarmPayload failed: $e');
+  }
 }
 
 class AlarmApp extends StatelessWidget {
@@ -34,6 +105,7 @@ class AlarmApp extends StatelessWidget {
 
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      navigatorKey: navigatorKey,
       title: 'Smart Alarm',
       theme: ThemeData(
         useMaterial3: true,
@@ -305,6 +377,8 @@ class AlarmNotificationService {
   final FlutterLocalNotificationsPlugin _notifications =
       FlutterLocalNotificationsPlugin();
   bool _isInitialized = false;
+  static const MethodChannel _platform = MethodChannel('alarm_app/settings');
+  static const MethodChannel _nativeAlarm = MethodChannel('alarm_app/native_alarm');
 
   Future<void> initialize() async {
     if (_isInitialized) {
@@ -326,12 +400,55 @@ class AlarmNotificationService {
       iOS: DarwinInitializationSettings(),
     );
 
-    await _notifications.initialize(settings: initializationSettings);
+    await _notifications.initialize(
+      settings: initializationSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) async {
+        final payload = response.payload;
+        if (payload == null) return;
+
+        try {
+          final alarms = await AlarmStorage.instance.loadAlarms();
+          final matched = alarms.where((a) => a.id == payload).toList();
+          if (matched.isNotEmpty) {
+            final alarm = matched.first;
+            navigatorKey.currentState?.push(
+              MaterialPageRoute(builder: (_) => AlarmRingingScreen(alarm: alarm)),
+            );
+          }
+        } catch (e) {
+          debugPrint('Failed to open alarm from notification payload: $e');
+        }
+      },
+    );
 
     final androidImplementation = _notifications
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
+    try {
+      const alarmChannel = AndroidNotificationChannel(
+        'smart_alarm_channel',
+        'Smart Alarm',
+        description: 'Scheduled alarms that keep working when the app is closed.',
+        importance: Importance.max,
+        playSound: true,
+        enableVibration: true,
+      );
+      const reminderChannel = AndroidNotificationChannel(
+        'smart_alarm_reminder_channel_v3',
+        'Alarm Reminders',
+        description: 'Reminders before alarms go off.',
+        importance: Importance.high,
+        playSound: true,
+        enableVibration: true,
+      );
+
+      await androidImplementation?.createNotificationChannel(alarmChannel);
+      await androidImplementation?.createNotificationChannel(reminderChannel);
+    } catch (error, stackTrace) {
+      debugPrint('Notification channel setup failed: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
     // Ask for runtime permissions needed for alarm notifications.
     try {
       await androidImplementation?.requestNotificationsPermission();
@@ -340,6 +457,8 @@ class AlarmNotificationService {
       debugPrint('Notification permission request failed: $error');
       debugPrintStack(stackTrace: stackTrace);
     }
+
+    // Provide helpers to open system settings from Dart via MethodChannel.
 
     _isInitialized = true;
   }
@@ -369,33 +488,214 @@ class AlarmNotificationService {
       }
 
       final scheduledDate = _nextWeeklyOccurrence(alarm.timeOfDay, dayIndex);
-      await _notifications.zonedSchedule(
-        id: _notificationIdForDay(alarm.notificationId, dayIndex),
-        title: 'Smart Alarm',
-        body: alarm.label,
-        scheduledDate: scheduledDate,
-        notificationDetails: _alarmNotificationDetails(alarm.sound),
-        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-        matchDateTimeComponents: DateTimeComponents.dayOfWeekAndTime,
-        payload: alarm.id,
-      );
+      
+      // Schedule pre-alarm notifications at 10, 5, and 1 minute before using
+      // the native AlarmManager path. Skip any pre-alarms that would trigger
+      // in the past to avoid immediately firing them when the alarm is created.
+      final now = tz.TZDateTime.now(tz.local);
+      for (final minutesBefore in [10, 5, 1]) {
+        final preAlarmDate = scheduledDate.subtract(Duration(minutes: minutesBefore));
+        if (!preAlarmDate.isAfter(now)) {
+          // Skip pre-alarm already in the past.
+          continue;
+        }
+        try {
+          await scheduleNativeAlarm(
+            _notificationIdForDay(alarm.notificationId, dayIndex, minutesBefore),
+            preAlarmDate.toLocal(),
+            'Alarm in $minutesBefore minute${minutesBefore > 1 ? 's' : ''}',
+            alarm.label,
+            payload: alarm.id,
+            launchAlarmUi: false,
+            soundUri: alarm.sound.filePath,
+          );
+        } catch (e) {
+          debugPrint('Native schedule for pre-alarm failed: $e');
+        }
+      }
+
+      // Schedule main alarm notification via native scheduler.
+      try {
+        await scheduleNativeAlarm(
+          _notificationIdForDay(alarm.notificationId, dayIndex),
+          scheduledDate.toLocal(),
+          'Smart Alarm',
+          alarm.label,
+          payload: alarm.id,
+          launchAlarmUi: true,
+          soundUri: alarm.sound.filePath,
+        );
+      } catch (e) {
+        debugPrint('Native schedule for main alarm failed: $e');
+      }
     }
   }
 
   Future<void> cancelAlarm(AlarmEntry alarm) async {
     await initialize();
 
-    // Each alarm can have up to 7 scheduled notifications (one per day).
+    // Each alarm can have up to 7 scheduled notifications (one per day) plus 3 pre-alarms per day.
     for (var dayIndex = 0; dayIndex < 7; dayIndex++) {
-      await _notifications.cancel(
-        id: _notificationIdForDay(alarm.notificationId, dayIndex),
-      );
+      // Cancel pre-alarm notifications (10, 5, 1 minutes before)
+      for (final minutesBefore in [10, 5, 1]) {
+        final id = _notificationIdForDay(alarm.notificationId, dayIndex, minutesBefore);
+        try {
+          await _notifications.cancel(id: id);
+        } catch (e) {
+          debugPrint('Flutter cancel pre-alarm failed for $id: $e');
+        }
+        try {
+          await cancelNativeAlarm(id);
+        } catch (e) {
+          debugPrint('Native cancel pre-alarm failed for $id: $e');
+        }
+      }
+
+      // Cancel main alarm notification
+      final mainId = _notificationIdForDay(alarm.notificationId, dayIndex);
+      try {
+        await _notifications.cancel(id: mainId);
+      } catch (e) {
+        debugPrint('Flutter cancel main alarm failed for $mainId: $e');
+      }
+      try {
+        await cancelNativeAlarm(mainId);
+      } catch (e) {
+        debugPrint('Native cancel main alarm failed for $mainId: $e');
+      }
     }
   }
 
   Future<void> cancelAll() async {
     await initialize();
+    try {
+      final stored = await AlarmStorage.instance.loadAlarms();
+      for (final alarm in stored) {
+        await cancelAlarm(alarm);
+      }
+    } catch (e) {
+      debugPrint('Failed to cancel native alarms from storage: $e');
+    }
+
+    // Ensure flutter scheduled notifications are cleared as well.
     await _notifications.cancelAll();
+  }
+
+  Future<List<PendingNotificationRequest>> pendingNotifications() async {
+    await initialize();
+    return _notifications.pendingNotificationRequests();
+  }
+  
+  Future<void> showImmediateTestNotification(AlarmEntry alarm) async {
+    await initialize();
+    await _notifications.show(
+      id: alarm.notificationId + 9999,
+      title: 'Test Alarm',
+      body: alarm.label,
+      notificationDetails: _alarmNotificationDetails(alarm.sound),
+      payload: alarm.id,
+    );
+  }
+
+  /// Schedule a quick zonedSchedule test 10 seconds from now to verify
+  /// scheduled delivery on the device.
+  Future<void> scheduleQuickZonedTest() async {
+    await initialize();
+    final now = tz.TZDateTime.now(tz.local);
+    final scheduled = now.add(const Duration(seconds: 10));
+    try {
+      await scheduleNativeAlarm(999901, scheduled.toLocal(), 'Scheduled Test Alarm', 'scheduled test', payload: 'scheduled_test', launchAlarmUi: true);
+    } catch (e) {
+      debugPrint('Native quick test schedule failed: $e');
+      // Fallback: try flutter scheduled notification as a best-effort.
+      await _notifications.zonedSchedule(
+        id: 999901,
+        title: 'Scheduled Test Alarm',
+        body: 'scheduled test',
+        scheduledDate: scheduled,
+        notificationDetails: _alarmNotificationDetails(const AlarmSoundChoice.phoneFile(displayName: 'Test', filePath: '')),
+        payload: 'scheduled_test',
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      );
+    }
+  }
+
+  Future<bool?> requestNotificationPermission() async {
+    await initialize();
+    final androidImpl = _notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    try {
+      return await androidImpl?.requestNotificationsPermission();
+    } catch (e) {
+      debugPrint('requestNotificationPermission failed: $e');
+      return null;
+    }
+  }
+
+  Future<bool?> requestExactAlarmsPermission() async {
+    await initialize();
+    final androidImpl = _notifications.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    try {
+      return await androidImpl?.requestExactAlarmsPermission();
+    } catch (e) {
+      debugPrint('requestExactAlarmsPermission failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> openAppSettings() async {
+    try {
+      await _platform.invokeMethod('openAppSettings');
+    } catch (e) {
+      debugPrint('openAppSettings failed: $e');
+    }
+  }
+
+  Future<void> openBatterySettings() async {
+    try {
+      await _platform.invokeMethod('openBatterySettings');
+    } catch (e) {
+      debugPrint('openBatterySettings failed: $e');
+    }
+  }
+
+  Future<void> scheduleNativeAlarm(
+    int id,
+    DateTime dateTime,
+    String title,
+    String body, {
+    String? payload,
+    bool launchAlarmUi = true,
+    String? soundUri,
+  }) async {
+    try {
+      await _platform.invokeMethod('scheduleNativeAlarm', {
+        'id': id,
+        'triggerAt': dateTime.millisecondsSinceEpoch,
+        'title': title,
+        'body': body,
+        'payload': payload ?? id.toString(),
+        'launchAlarmUi': launchAlarmUi,
+        'soundUri': soundUri,
+      });
+    } catch (e) {
+      debugPrint('scheduleNativeAlarm failed: $e');
+    }
+  }
+
+  Future<void> cancelNativeAlarm(int id) async {
+    try {
+      await _platform.invokeMethod('cancelNativeAlarm', {'id': id});
+    } catch (e) {
+      debugPrint('cancelNativeAlarm failed: $e');
+    }
+  }
+
+  Future<void> stopNativeAlarmSound() async {
+    try {
+      await _platform.invokeMethod('stopNativeAlarmSound');
+    } catch (e) {
+      debugPrint('stopNativeAlarmSound failed: $e');
+    }
   }
 
   NotificationDetails _alarmNotificationDetails(AlarmSoundChoice sound) {
@@ -418,11 +718,35 @@ class AlarmNotificationService {
       ),
     );
   }
+
+  NotificationDetails _preAlarmNotificationDetails() {
+    // This is the notification channel for pre-alarm reminders.
+    return const NotificationDetails(
+      android: AndroidNotificationDetails(
+        'smart_alarm_reminder_channel',
+        'Alarm Reminders',
+        channelDescription: 'Reminders before alarms go off.',
+        importance: Importance.max,
+        priority: Priority.max,
+        playSound: true,
+        enableVibration: true,
+        fullScreenIntent: true,
+        audioAttributesUsage: AudioAttributesUsage.alarm,
+        category: AndroidNotificationCategory.reminder,
+      ),
+    );
+  }
 }
 
-int _notificationIdForDay(int alarmId, int dayIndex) {
-  // Keep ids deterministic so each weekday can be canceled precisely.
-  return alarmId * 10 + dayIndex;
+int _notificationIdForDay(int alarmId, int dayIndex, [int minutesBefore = 0]) {
+  // Keep ids deterministic so each notification can be canceled precisely.
+  // Main alarm: alarmId * 100 + dayIndex
+  // Pre-alarms: alarmId * 100 + dayIndex + (10/20/30 for 10/5/1 mins before)
+  if (minutesBefore == 0) {
+    return alarmId * 100 + dayIndex;
+  }
+  final offsetMap = {10: 10, 5: 20, 1: 30};
+  return alarmId * 100 + dayIndex + (offsetMap[minutesBefore] ?? 0);
 }
 
 tz.TZDateTime _nextWeeklyOccurrence(TimeOfDay timeOfDay, int dayIndex) {
@@ -457,6 +781,38 @@ class AlarmShell extends StatefulWidget {
 }
 
 class _AlarmShellState extends State<AlarmShell> {
+  Future<void> _showPendingNotifications() async {
+    final pending = await AlarmNotificationService.instance.pendingNotifications();
+    if (!mounted) return;
+
+    if (pending.isEmpty) {
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: const Text('Pending Notifications'),
+          content: const Text('No pending scheduled notifications found.'),
+          actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+        ),
+      );
+      return;
+    }
+
+    final lines = pending.map((p) => 'id: ${p.id} | title: ${p.title ?? ''} | body: ${p.body ?? ''} | payload: ${p.payload ?? ''}').toList();
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Pending Notifications'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Text(lines.join('\n')),
+          ),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close'))],
+      ),
+    );
+  }
+
   int _selectedTab = 0;
   bool _loading = true;
   final List<AlarmEntry> _alarms = [];
@@ -465,6 +821,9 @@ class _AlarmShellState extends State<AlarmShell> {
   void initState() {
     super.initState();
     _loadAlarms();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _flushQueuedAlarmScreen();
+    });
   }
 
   Future<void> _loadAlarms() async {
@@ -589,6 +948,26 @@ class _AlarmShellState extends State<AlarmShell> {
         onDeleteAlarm: _deleteAlarm,
         onToggleAlarm: _toggleAlarm,
         onTestAlarm: _testAlarm,
+        onDebugPending: _showPendingNotifications,
+        onSendImmediateTest: () async {
+          if (_alarms.isEmpty) {
+            if (!mounted) return;
+            await showDialog<void>(
+              context: context,
+              builder: (_) => AlertDialog(
+                title: const Text('No alarms'),
+                content: const Text('Create an alarm first to run a test.'),
+                actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
+              ),
+            );
+            return;
+          }
+
+          // Use the first alarm as a test target.
+          await AlarmNotificationService.instance.showImmediateTestNotification(_alarms.first);
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Test notification sent')));
+        },
       ),
       const CalendarPlaceholderScreen(),
     ];
@@ -694,6 +1073,93 @@ class _BottomTabButton extends StatelessWidget {
   }
 }
 
+class TroubleshootScreen extends StatefulWidget {
+  const TroubleshootScreen({super.key});
+
+  @override
+  State<TroubleshootScreen> createState() => _TroubleshootScreenState();
+}
+
+class _TroubleshootScreenState extends State<TroubleshootScreen> {
+  String _status = '';
+  bool _loading = false;
+
+  Future<void> _checkNotificationPermission() async {
+    setState(() { _loading = true; _status = 'Checking...'; });
+    final granted = await AlarmNotificationService.instance.requestNotificationPermission();
+    setState(() { _loading = false; _status = 'Notification permission: ${granted == true ? 'granted' : 'denied/unknown'}'; });
+  }
+
+  Future<void> _checkExactAlarmsPermission() async {
+    setState(() { _loading = true; _status = 'Checking...'; });
+    final granted = await AlarmNotificationService.instance.requestExactAlarmsPermission();
+    setState(() { _loading = false; _status = 'Exact alarms permission: ${granted == true ? 'granted' : 'denied/unknown'}'; });
+  }
+
+  Future<void> _openAppSettings() async {
+    await AlarmNotificationService.instance.openAppSettings();
+  }
+
+  Future<void> _openBatterySettings() async {
+    await AlarmNotificationService.instance.openBatterySettings();
+  }
+
+  Future<void> _sendImmediateTest() async {
+    final alarms = await AlarmStorage.instance.loadAlarms();
+    if (alarms.isEmpty) {
+      if (!mounted) return;
+      showDialog<void>(context: context, builder: (_) => AlertDialog(title: const Text('No alarms'), content: const Text('Create an alarm first.'), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))]));
+      return;
+    }
+    await AlarmNotificationService.instance.showImmediateTestNotification(alarms.first);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Immediate test notification sent')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Troubleshoot')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              FilledButton(onPressed: _checkNotificationPermission, child: const Text('Check / Request Notification Permission')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: _checkExactAlarmsPermission, child: const Text('Check / Request Exact Alarms Permission')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: _openAppSettings, child: const Text('Open App Notification Settings')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: _openBatterySettings, child: const Text('Open Battery Optimization Settings')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: _sendImmediateTest, child: const Text('Send Immediate Test Notification')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: () async {
+                await AlarmNotificationService.instance.scheduleQuickZonedTest();
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Scheduled zoned test set for 10s')));
+              }, child: const Text('Schedule Quick Zoned Test (10s)')),
+              const SizedBox(height: 8),
+              FilledButton(onPressed: () async {
+                final id = 999903;
+                final scheduled = DateTime.now().add(const Duration(seconds: 10));
+                await AlarmNotificationService.instance.scheduleNativeAlarm(id, scheduled, 'Native Scheduled Test', 'native scheduled test', payload: 'native_test');
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Scheduled native alarm for 10s')));
+              }, child: const Text('Schedule Native Test (10s)')),
+              const SizedBox(height: 16),
+              if (_loading) const Center(child: CircularProgressIndicator()),
+              if (_status.isNotEmpty) Text(_status),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class AlarmListScreen extends StatelessWidget {
   const AlarmListScreen({
     super.key,
@@ -703,6 +1169,8 @@ class AlarmListScreen extends StatelessWidget {
     required this.onDeleteAlarm,
     required this.onToggleAlarm,
     required this.onTestAlarm,
+    required this.onDebugPending,
+    required this.onSendImmediateTest,
   });
 
   final List<AlarmEntry> alarms;
@@ -711,6 +1179,8 @@ class AlarmListScreen extends StatelessWidget {
   final ValueChanged<String> onDeleteAlarm;
   final void Function(String id, bool enabled) onToggleAlarm;
   final ValueChanged<AlarmEntry> onTestAlarm;
+  final VoidCallback onDebugPending;
+  final VoidCallback onSendImmediateTest;
 
   @override
   Widget build(BuildContext context) {
@@ -735,21 +1205,38 @@ class AlarmListScreen extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const SizedBox(height: 4),
-                const Row(
+                Row(
                   children: [
-                    Icon(
+                    const Icon(
                       Icons.notifications_none,
                       color: Colors.white,
                       size: 30,
                     ),
-                    SizedBox(width: 8),
-                    Text(
-                      'Smart Alarm',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.w700,
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Smart Alarm',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 22,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
+                    ),
+                    IconButton(
+                      onPressed: onDebugPending,
+                      icon: const Icon(Icons.bug_report, color: Colors.white),
+                      tooltip: 'Show pending notifications',
+                    ),
+                    IconButton(
+                      onPressed: onSendImmediateTest,
+                      icon: const Icon(Icons.play_arrow, color: Colors.white),
+                      tooltip: 'Send immediate test notification',
+                    ),
+                    IconButton(
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const TroubleshootScreen())),
+                      icon: const Icon(Icons.settings, color: Colors.white),
+                      tooltip: 'Troubleshoot',
                     ),
                   ],
                 ),
@@ -1158,7 +1645,7 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
     _minute = timeOfDay.minute;
     _isPm = timeOfDay.period == DayPeriod.pm;
     _labelController = TextEditingController(
-      text: initial?.label ?? 'Wake up for school',
+      text: initial?.label ?? 'Alarm',
     );
     _repeatDays = List<bool>.from(
       initial?.repeatDays ?? [false, true, true, true, true, true, false],
@@ -1260,18 +1747,15 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
     }
   }
 
-  void _changeHour(int delta) {
+  void _changeHour(int newHour) {
     setState(() {
-      _hour = (_hour + delta - 1) % 12 + 1;
+      _hour = newHour;
     });
   }
 
-  void _changeMinute(int delta) {
+  void _changeMinute(int newMinute) {
     setState(() {
-      _minute = (_minute + delta) % 60;
-      if (_minute < 0) {
-        _minute += 60;
-      }
+      _minute = newMinute;
     });
   }
 
@@ -1314,10 +1798,11 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          _TimePickerTile(
-                            value: _hour.toString().padLeft(2, '0'),
-                            onIncrease: () => _changeHour(1),
-                            onDecrease: () => _changeHour(-1),
+                          _ScrollableNumberPicker(
+                            value: _hour,
+                            minValue: 1,
+                            maxValue: 12,
+                            onChanged: _changeHour,
                           ),
                           const SizedBox(width: 8),
                           const Text(
@@ -1328,10 +1813,11 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          _TimePickerTile(
-                            value: _minute.toString().padLeft(2, '0'),
-                            onIncrease: () => _changeMinute(1),
-                            onDecrease: () => _changeMinute(-1),
+                          _ScrollableNumberPicker(
+                            value: _minute,
+                            minValue: 0,
+                            maxValue: 59,
+                            onChanged: _changeMinute,
                           ),
                         ],
                       ),
@@ -1533,56 +2019,138 @@ class _SectionCard extends StatelessWidget {
   }
 }
 
-class _TimePickerTile extends StatelessWidget {
-  const _TimePickerTile({
+class _ScrollableNumberPicker extends StatefulWidget {
+  const _ScrollableNumberPicker({
     required this.value,
-    required this.onIncrease,
-    required this.onDecrease,
+    required this.onChanged,
+    required this.minValue,
+    required this.maxValue,
   });
 
-  final String value;
-  final VoidCallback onIncrease;
-  final VoidCallback onDecrease;
+  final int value;
+  final ValueChanged<int> onChanged;
+  final int minValue;
+  final int maxValue;
+
+  @override
+  State<_ScrollableNumberPicker> createState() =>
+      _ScrollableNumberPickerState();
+}
+
+class _ScrollableNumberPickerState extends State<_ScrollableNumberPicker> {
+  Future<void> _showInputDialog() async {
+    final controller = TextEditingController(text: widget.value.toString());
+    final result = await showDialog<int>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Enter value'),
+          content: TextField(
+            controller: controller,
+            keyboardType: TextInputType.number,
+            maxLength: 2,
+            decoration: InputDecoration(
+              hintText: 'Between ${widget.minValue} and ${widget.maxValue}',
+              border: const OutlineInputBorder(),
+            ),
+            autofocus: true,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                final parsed = int.tryParse(controller.text.trim());
+                if (parsed != null &&
+                    parsed >= widget.minValue &&
+                    parsed <= widget.maxValue) {
+                  Navigator.pop(context, parsed);
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Enter a number between ${widget.minValue} and ${widget.maxValue}',
+                      ),
+                      duration: const Duration(seconds: 2),
+                    ),
+                  );
+                }
+              },
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+    if (result != null) {
+      widget.onChanged(result);
+    }
+  }
+
+  void _increment() {
+    if (widget.value < widget.maxValue) {
+      widget.onChanged(widget.value + 1);
+    }
+  }
+
+  void _decrement() {
+    if (widget.value > widget.minValue) {
+      widget.onChanged(widget.value - 1);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        IconButton(
-          onPressed: onIncrease,
-          icon: const Icon(Icons.keyboard_arrow_up_rounded),
-          visualDensity: VisualDensity.standard,
-          padding: const EdgeInsets.all(8),
-          constraints: const BoxConstraints.tightFor(width: 48, height: 48),
-        ),
-        Container(
-          width: 78,
-          height: 74,
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(14),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.04),
-                blurRadius: 14,
-                offset: const Offset(0, 6),
-              ),
-            ],
+    return GestureDetector(
+      onTap: _showInputDialog,
+      child: Column(
+        children: [
+          IconButton(
+            onPressed: _increment,
+            icon: const Icon(Icons.keyboard_arrow_up_rounded),
+            visualDensity: VisualDensity.standard,
+            padding: const EdgeInsets.all(8),
+            constraints: const BoxConstraints.tightFor(width: 48, height: 48),
           ),
-          child: Text(
-            value,
-            style: const TextStyle(fontSize: 32, fontWeight: FontWeight.w800),
+          Container(
+            width: 78,
+            height: 74,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.04),
+                  blurRadius: 14,
+                  offset: const Offset(0, 6),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  widget.value.toString().padLeft(2, '0'),
+                  style: const TextStyle(
+                    fontSize: 32,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-        IconButton(
-          onPressed: onDecrease,
-          icon: const Icon(Icons.keyboard_arrow_down_rounded),
-          visualDensity: VisualDensity.standard,
-          padding: const EdgeInsets.all(8),
-          constraints: const BoxConstraints.tightFor(width: 48, height: 48),
-        ),
-      ],
+          IconButton(
+            onPressed: _decrement,
+            icon: const Icon(Icons.keyboard_arrow_down_rounded),
+            visualDensity: VisualDensity.standard,
+            padding: const EdgeInsets.all(8),
+            constraints: const BoxConstraints.tightFor(width: 48, height: 48),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1701,6 +2269,7 @@ class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
   late final List<MathQuestion> _questions;
   late final TextEditingController _answerController;
   late final AudioPlayer _alarmPlayer;
+  late final int _questionSeed;
   int _index = 0;
   String? _errorText;
   String? _soundError;
@@ -1708,10 +2277,18 @@ class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
   @override
   void initState() {
     super.initState();
-    _questions = _generateQuestions(widget.alarm.difficulty, count: 5);
+    _questionSeed = Random().nextInt(1 << 32);
+    _questions = _generateQuestions(widget.alarm.difficulty, count: 5, seed: _questionSeed);
     _answerController = TextEditingController();
     _alarmPlayer = AudioPlayer()..setReleaseMode(ReleaseMode.loop);
-    _playAlarmSound();
+    // Stop any native playback started while the device was asleep, then
+    // start Flutter's player. This avoids duplicate overlapping audio.
+    Future.microtask(() async {
+      try {
+        await AlarmNotificationService.instance.stopNativeAlarmSound();
+      } catch (_) {}
+      if (mounted) await _playAlarmSound();
+    });
   }
 
   @override
@@ -1726,42 +2303,32 @@ class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
       await _alarmPlayer.stop();
       await _alarmPlayer.play(widget.alarm.sound.toAudioSource());
     } catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _soundError = 'Sound playback failed: $error';
-      });
+      if (!mounted) return;
+      setState(() => _soundError = 'Sound playback failed: $error');
     }
   }
 
-  Future<void> _stopAlarmSound() async {
-    await _alarmPlayer.stop();
-  }
+  Future<void> _stopAlarmSound() async => await _alarmPlayer.stop();
 
-  void _submit() {
+  Future<void> _submit() async {
     final parsed = int.tryParse(_answerController.text.trim());
     if (parsed == null) {
       setState(() => _errorText = 'Enter a number.');
       return;
     }
-
     if (parsed != _questions[_index].answer) {
       setState(() => _errorText = 'Try again.');
       return;
     }
-
-    setState(() {
-      _errorText = null;
-      _answerController.clear();
-      if (_index < _questions.length - 1) {
-        _index += 1;
-      } else {
-          _stopAlarmSound();
-        Navigator.of(context).pop(true);
-      }
-    });
+    if (_index < _questions.length - 1) {
+      setState(() { _index += 1; _errorText = null; _answerController.clear(); });
+    } else {
+      await _stopAlarmSound();
+      try {
+        await AlarmNotificationService.instance.stopNativeAlarmSound();
+      } catch (_) {}
+      if (mounted) Navigator.of(context).pop(true);
+    }
   }
 
   @override
@@ -1787,131 +2354,44 @@ class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
               ),
               child: Column(
                 children: [
-                  const Icon(
-                    Icons.notifications_none_rounded,
-                    color: Colors.white,
-                    size: 44,
-                  ),
+                  const Icon(Icons.notifications_none_rounded, color: Colors.white, size: 44),
                   const SizedBox(height: 10),
-                  Text(
-                    '${time.hour}:${time.minute} ${time.period}',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 44,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
+                  Text('${time.hour}:${time.minute} ${time.period}', style: const TextStyle(color: Colors.white, fontSize: 44, fontWeight: FontWeight.w800)),
                   const SizedBox(height: 2),
-                  Text(
-                    widget.alarm.label,
-                    style: const TextStyle(color: Colors.white, fontSize: 18),
-                  ),
+                  Text(widget.alarm.label, style: const TextStyle(color: Colors.white, fontSize: 18)),
                 ],
               ),
             ),
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 20, 16, 16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text(
-                      'Solve the Math Problem!',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 24,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      '${_index + 1}/${_questions.length}',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontSize: 15,
-                        color: Color(0xFF535867),
-                      ),
-                    ),
-                    if (_soundError != null) ...[
-                      const SizedBox(height: 10),
-                      Text(
-                        _soundError!,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          color: Color(0xFFE11D48),
-                          fontSize: 12,
-                        ),
-                      ),
+              child: SingleChildScrollView(
+                padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom + 16),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 20, 16, 16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text('Solve the Math Problem!', textAlign: TextAlign.center, style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+                      const SizedBox(height: 6),
+                      Text('${_index + 1}/${_questions.length}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 15, color: Color(0xFF535867))),
+                      if (_soundError != null) ...[
+                        const SizedBox(height: 10),
+                        Text(_soundError!, textAlign: TextAlign.center, style: const TextStyle(color: Color(0xFFE11D48), fontSize: 12)),
+                      ],
+                      const SizedBox(height: 14),
+                      Container(padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 22), decoration: BoxDecoration(color: const Color(0xFFF1F2FF), borderRadius: BorderRadius.circular(18)), child: Text(currentQuestion.question, textAlign: TextAlign.center, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800))),
+                      const SizedBox(height: 14),
+                      TextField(controller: _answerController, keyboardType: TextInputType.number, onSubmitted: (_) => _submit(), decoration: InputDecoration(hintText: 'Enter your answer here', errorText: _errorText, border: OutlineInputBorder(borderRadius: BorderRadius.circular(18)), contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16)), textAlign: TextAlign.center),
+                      const SizedBox(height: 12),
+                      ClipRRect(borderRadius: BorderRadius.circular(999), child: LinearProgressIndicator(value: progress, minHeight: 6, backgroundColor: const Color(0xFFE8E2FA), valueColor: const AlwaysStoppedAnimation(Color(0xFF5B33F5)))),
+                      const SizedBox(height: 12),
+                      Align(alignment: Alignment.center, child: _DifficultyChip(widget.alarm.difficulty)),
+                      const SizedBox(height: 12),
+                      SizedBox(height: 54, child: FilledButton(onPressed: _submit, child: const Text('Submit Answer to Stop Alarm!'))),
                     ],
-                    const SizedBox(height: 14),
-                    // This is the current question the user has to solve to stop the alarm.
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 22,
-                      ),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF1F2FF),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: Text(
-                        currentQuestion.question,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    // The answer box stays simple so the user can type fast when the alarm goes off.
-                    TextField(
-                      controller: _answerController,
-                      keyboardType: TextInputType.number,
-                      onSubmitted: (_) => _submit(),
-                      decoration: InputDecoration(
-                        hintText: 'Enter your answer here',
-                        errorText: _errorText,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(18),
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 18,
-                          vertical: 16,
-                        ),
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 12),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(999),
-                      child: LinearProgressIndicator(
-                        value: progress,
-                        minHeight: 6,
-                        backgroundColor: const Color(0xFFE8E2FA),
-                        valueColor: const AlwaysStoppedAnimation(
-                          Color(0xFF5B33F5),
-                        ),
-                      ),
-                    ),
-                    const Spacer(),
-                    Align(
-                      alignment: Alignment.center,
-                      child: _DifficultyChip(widget.alarm.difficulty),
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      height: 54,
-                      child: FilledButton(
-                        onPressed: _submit,
-                        child: const Text('Submit Answer to Stop Alarm!'),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
             ),
-            // This builds the practice questions for both the preview card and the live alarm challenge.
           ],
         ),
       ),
@@ -1919,12 +2399,17 @@ class _AlarmRingingScreenState extends State<AlarmRingingScreen> {
   }
 }
 
-({String hour, String minute, String period}) _formatAlarmTime(
-  TimeOfDay timeOfDay,
-) {
-  final hour = timeOfDay.hourOfPeriod == 0 ? 12 : timeOfDay.hourOfPeriod;
-  return (
-    hour: hour.toString().padLeft(2, '0'),
+class _FormattedAlarmTime {
+  final String hour;
+  final String minute;
+  final String period;
+  const _FormattedAlarmTime({required this.hour, required this.minute, required this.period});
+}
+
+_FormattedAlarmTime _formatAlarmTime(TimeOfDay timeOfDay) {
+  final displayHour = timeOfDay.hourOfPeriod == 0 ? 12 : timeOfDay.hourOfPeriod;
+  return _FormattedAlarmTime(
+    hour: displayHour.toString().padLeft(2, '0'),
     minute: timeOfDay.minute.toString().padLeft(2, '0'),
     period: timeOfDay.period == DayPeriod.am ? 'AM' : 'PM',
   );
@@ -1951,25 +2436,56 @@ String _fileNameFromPath(String filePath) {
 List<MathQuestion> _generateQuestions(
   AlarmDifficulty difficulty, {
   int count = 3,
+  int? seed,
 }) {
-  final random = Random(difficulty.index + count);
+  final random = seed == null ? Random() : Random(seed);
   final questions = <MathQuestion>[];
 
   for (var index = 0; index < count; index++) {
     final a = _nextNumber(random, difficulty);
     final b = _nextNumber(random, difficulty);
     final c = _nextNumber(random, difficulty);
-    final question = switch (difficulty) {
-      AlarmDifficulty.easy => '$a + $b = ?',
-      AlarmDifficulty.medium => '($a x $b) + $c = ?',
-      AlarmDifficulty.hard => '($a x $b) + ($b x $c) = ?',
-    };
-
-    final answer = switch (difficulty) {
-      AlarmDifficulty.easy => a + b,
-      AlarmDifficulty.medium => (a * b) + c,
-      AlarmDifficulty.hard => (a * b) + (b * c),
-    };
+    final pattern = random.nextInt(3);
+    String question;
+    int answer;
+    switch (difficulty) {
+      case AlarmDifficulty.easy:
+        if (pattern == 0) {
+          question = '$a + $b = ?';
+          answer = a + b;
+        } else if (pattern == 1) {
+          question = '$a - $b = ?';
+          answer = a - b;
+        } else {
+          question = '$a x $b = ?';
+          answer = a * b;
+        }
+        break;
+      case AlarmDifficulty.medium:
+        if (pattern == 0) {
+          question = '($a x $b) + $c = ?';
+          answer = (a * b) + c;
+        } else if (pattern == 1) {
+          question = '($a + $b) x $c = ?';
+          answer = (a + b) * c;
+        } else {
+          question = '($a x $b) - $c = ?';
+          answer = (a * b) - c;
+        }
+        break;
+      case AlarmDifficulty.hard:
+        if (pattern == 0) {
+          question = '($a x $b) + ($b x $c) = ?';
+          answer = (a * b) + (b * c);
+        } else if (pattern == 1) {
+          question = '($a + $b) x ($c - 1) = ?';
+          answer = (a + b) * (c - 1);
+        } else {
+          question = '($a x $b) - ($c + $a) = ?';
+          answer = (a * b) - (c + a);
+        }
+        break;
+    }
 
     questions.add(MathQuestion(question: question, answer: answer));
   }
@@ -1978,9 +2494,12 @@ List<MathQuestion> _generateQuestions(
 }
 
 int _nextNumber(Random random, AlarmDifficulty difficulty) {
-  return switch (difficulty) {
-    AlarmDifficulty.easy => random.nextInt(8) + 2,
-    AlarmDifficulty.medium => random.nextInt(9) + 2,
-    AlarmDifficulty.hard => random.nextInt(10) + 2,
-  };
+  switch (difficulty) {
+    case AlarmDifficulty.easy:
+      return random.nextInt(8) + 2;
+    case AlarmDifficulty.medium:
+      return random.nextInt(9) + 2;
+    case AlarmDifficulty.hard:
+      return random.nextInt(10) + 2;
+  }
 }
