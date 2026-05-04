@@ -369,6 +369,140 @@ class AlarmStorage {
   }
 }
 
+enum SchedulePriority { veryImportant, semiImportant, leastImportant, optional, other }
+
+extension SchedulePriorityLabel on SchedulePriority {
+  String get label {
+    switch (this) {
+      case SchedulePriority.veryImportant:
+        return 'Very Important';
+      case SchedulePriority.semiImportant:
+        return 'Semi-Important';
+      case SchedulePriority.leastImportant:
+        return 'Least-Important';
+      case SchedulePriority.optional:
+        return 'Optional';
+      case SchedulePriority.other:
+        return 'Other';
+    }
+  }
+
+  Color get color {
+    switch (this) {
+      case SchedulePriority.veryImportant:
+        return const Color(0xFFE11D48);
+      case SchedulePriority.semiImportant:
+        return const Color(0xFFF59E0B);
+      case SchedulePriority.leastImportant:
+        return const Color(0xFF22C55E);
+      case SchedulePriority.optional:
+        return const Color(0xFF6B7280);
+      case SchedulePriority.other:
+        return const Color(0xFF7C3AED);
+    }
+  }
+}
+
+class ScheduleEntry {
+  const ScheduleEntry({
+    required this.id,
+    required this.date,
+    required this.startTime,
+    required this.endTime,
+    required this.title,
+    required this.description,
+    required this.priority,
+    
+  });
+
+  final String id;
+  final DateTime date;
+  final TimeOfDay startTime;
+  final TimeOfDay endTime;
+  final String title;
+  final String description;
+  final SchedulePriority priority;
+  
+
+  ScheduleEntry copyWith({
+    String? id,
+    DateTime? date,
+    TimeOfDay? startTime,
+    TimeOfDay? endTime,
+    String? title,
+    String? description,
+    SchedulePriority? priority,
+    
+  }) {
+    return ScheduleEntry(
+      id: id ?? this.id,
+      date: date ?? this.date,
+      startTime: startTime ?? this.startTime,
+      endTime: endTime ?? this.endTime,
+      title: title ?? this.title,
+      description: description ?? this.description,
+      priority: priority ?? this.priority,
+      
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'date': date.toIso8601String(),
+      'startHour': startTime.hour,
+      'startMinute': startTime.minute,
+      'endHour': endTime.hour,
+      'endMinute': endTime.minute,
+      'title': title,
+      'description': description,
+      'priority': priority.index,
+    };
+  }
+
+  factory ScheduleEntry.fromJson(Map<String, dynamic> json) {
+    final priorityIndex = (json['priority'] as int?) ?? SchedulePriority.other.index;
+    final safePriorityIndex = priorityIndex.clamp(0, SchedulePriority.values.length - 1);
+
+    return ScheduleEntry(
+      id: json['id'] as String? ?? DateTime.now().microsecondsSinceEpoch.toString(),
+      date: DateTime.tryParse(json['date'] as String? ?? '') ?? DateTime.now(),
+      startTime: TimeOfDay(
+        hour: (json['startHour'] as int?) ?? 7,
+        minute: (json['startMinute'] as int?) ?? 0,
+      ),
+      endTime: TimeOfDay(
+        hour: (json['endHour'] as int?) ?? 9,
+        minute: (json['endMinute'] as int?) ?? 0,
+      ),
+      title: json['title'] as String? ?? '',
+      description: json['description'] as String? ?? '',
+      priority: SchedulePriority.values[safePriorityIndex],
+    );
+  }
+}
+
+class ScheduleStorage {
+  ScheduleStorage._();
+
+  static final ScheduleStorage instance = ScheduleStorage._();
+  static const String _schedulesKey = 'saved_schedules';
+
+  Future<List<ScheduleEntry>> loadSchedules() async {
+    final preferences = await SharedPreferences.getInstance();
+    final rawSchedules = preferences.getStringList(_schedulesKey) ?? const [];
+    return rawSchedules
+        .map((item) => ScheduleEntry.fromJson(jsonDecode(item) as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  Future<void> saveSchedules(List<ScheduleEntry> schedules) async {
+    final preferences = await SharedPreferences.getInstance();
+    final encodedSchedules = schedules.map((schedule) => jsonEncode(schedule.toJson())).toList(growable: false);
+    await preferences.setStringList(_schedulesKey, encodedSchedules);
+  }
+}
+
 class AlarmNotificationService {
   AlarmNotificationService._();
 
@@ -797,7 +931,7 @@ class _AlarmShellState extends State<AlarmShell> {
     );
   }
 
-  int _selectedTab = 0;
+  int _selectedTab = 1;
   bool _loading = true;
   final List<AlarmEntry> _alarms = [];
 
@@ -923,7 +1057,6 @@ class _AlarmShellState extends State<AlarmShell> {
         body: SafeArea(child: Center(child: CircularProgressIndicator())),
       );
     }
-
     final pages = [
       AlarmListScreen(
         alarms: _alarms,
@@ -954,7 +1087,10 @@ class _AlarmShellState extends State<AlarmShell> {
                 messenger.showSnackBar(const SnackBar(content: Text('Test notification sent')));
         },
       ),
-      const CalendarPlaceholderScreen(),
+      HomeScreen(
+        alarms: _alarms,
+      ),
+      const NotesCalendarScreen(),
     ];
 
     return Scaffold(
@@ -970,23 +1106,6 @@ class _AlarmShellState extends State<AlarmShell> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
-                child: SizedBox(
-                  width: double.infinity,
-                  height: 48,
-                  child: FilledButton(
-                    onPressed: _openCreateAlarm,
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF5430E8),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
-                    child: const Icon(Icons.add_circle_outline, size: 26),
-                  ),
-                ),
-              ),
-              Padding(
                 padding: const EdgeInsets.only(bottom: 4),
                 child: Row(
                   children: [
@@ -1000,10 +1119,18 @@ class _AlarmShellState extends State<AlarmShell> {
                     ),
                     Expanded(
                       child: _BottomTabButton(
-                        icon: Icons.calendar_month_outlined,
-                        label: 'Calendar',
+                        icon: Icons.home_outlined,
+                        label: 'Home',
                         selected: _selectedTab == 1,
                         onTap: () => setState(() => _selectedTab = 1),
+                      ),
+                    ),
+                    Expanded(
+                      child: _BottomTabButton(
+                        icon: Icons.calendar_month_outlined,
+                        label: 'Calendar',
+                        selected: _selectedTab == 2,
+                        onTap: () => setState(() => _selectedTab = 2),
                       ),
                     ),
                   ],
@@ -1272,6 +1399,18 @@ class AlarmListScreen extends StatelessWidget {
                     itemCount: alarms.length,
                   ),
           ),
+          if (alarms.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 8, 14, 16),
+              child: SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: FilledButton(
+                  onPressed: onAddAlarm,
+                  child: const Text('Add New Alarm'),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -1579,21 +1718,1430 @@ class _SoundChip extends StatelessWidget {
   }
 }
 
-class CalendarPlaceholderScreen extends StatelessWidget {
-  const CalendarPlaceholderScreen({super.key});
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({
+    super.key,
+    required this.alarms,
+  });
+
+  final List<AlarmEntry> alarms;
+
+  int _dayIndexFor(DateTime date) => date.weekday == DateTime.sunday ? 0 : date.weekday;
 
   @override
   Widget build(BuildContext context) {
-    return const SafeArea(
+    final now = DateTime.now();
+    final dayIndex = _dayIndexFor(now);
+    final todaysAlarms = alarms.where((a) => a.repeatDays[dayIndex]).toList();
+
+    return SafeArea(
       bottom: false,
-      child: Center(
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF8738F2), Color(0xFF5B33F5)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.only(
+                bottomLeft: Radius.circular(24),
+                bottomRight: Radius.circular(24),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.home_outlined, color: Colors.white, size: 30),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text('Home', style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w700)),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(14, 14, 14, 120),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const SizedBox(height: 6),
+                  Text('Calendar', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.black.withValues(alpha: 0.90))),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('${now.day} ${[
+                          'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+                        ][now.month - 1]} ${now.year}', style: const TextStyle(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 8),
+                        if (todaysAlarms.isEmpty)
+                          const Text('No schedule for today', style: TextStyle(color: Color(0xFF666A78)))
+                        else
+                          Column(
+                            children: todaysAlarms.map((a) {
+                                    final t = _formatAlarmTime(a.timeOfDay);
+                              return ListTile(
+                                contentPadding: EdgeInsets.zero,
+                                leading: CircleAvatar(backgroundColor: const Color(0xFF5B33F5), child: Text(t.hour, style: const TextStyle(color: Colors.white))),
+                                title: Text('${t.hour}:${t.minute} ${t.period}'),
+                                subtitle: Text(a.label),
+                              );
+                            }).toList(),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Text('Alarms Today', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.black.withValues(alpha: 0.90))),
+                  const SizedBox(height: 8),
+                  if (todaysAlarms.isEmpty)
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                      child: const Text('No active alarms for today.'),
+                    )
+                  else
+                    Column(
+                      children: todaysAlarms.map((a) {
+                        final time = _formatAlarmTime(a.timeOfDay);
+                        final days = const ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+                        final isEnabled = a.enabled;
+
+                        return Container(
+                          width: double.infinity,
+                          margin: const EdgeInsets.only(bottom: 12),
+                          padding: const EdgeInsets.all(14),
+                          decoration: BoxDecoration(
+                            color: isEnabled ? Colors.white : const Color(0xFFF6F7FB),
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(
+                              color: isEnabled
+                                  ? Colors.transparent
+                                  : const Color(0xFFE3E6F2),
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Expanded(
+                                    child: Row(
+                                      crossAxisAlignment: CrossAxisAlignment.end,
+                                      children: [
+                                        Text(
+                                          time.hour,
+                                          style: const TextStyle(
+                                            fontSize: 34,
+                                            fontWeight: FontWeight.w800,
+                                            height: 0.95,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 2),
+                                        Text(
+                                          ':${time.minute}',
+                                          style: const TextStyle(
+                                            fontSize: 34,
+                                            fontWeight: FontWeight.w800,
+                                            height: 0.95,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          time.period,
+                                          style: const TextStyle(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w600,
+                                            color: Color(0xFF868B9A),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Container(
+                                      width: 44,
+                                      height: 26,
+                                      decoration: BoxDecoration(
+                                        color: isEnabled
+                                            ? const Color(0xFFB8A5FF)
+                                            : const Color(0xFFE5E7F0),
+                                        borderRadius: BorderRadius.circular(999),
+                                      ),
+                                      child: Align(
+                                        alignment: isEnabled
+                                            ? Alignment.centerRight
+                                            : Alignment.centerLeft,
+                                        child: Container(
+                                          width: 20,
+                                          height: 20,
+                                          margin: const EdgeInsets.all(3),
+                                          decoration: BoxDecoration(
+                                            color: isEnabled
+                                                ? const Color(0xFF5B33F5)
+                                                : const Color(0xFFB9BDCA),
+                                            shape: BoxShape.circle,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      a.label,
+                                      style: TextStyle(
+                                        fontSize: 15,
+                                        color: isEnabled
+                                            ? const Color(0xFF2F3140)
+                                            : const Color(0xFF8A90A3),
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  ),
+                                  if (!isEnabled)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFE5E7F0),
+                                        borderRadius: BorderRadius.circular(999),
+                                      ),
+                                      child: const Text(
+                                        'Off',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: Color(0xFF6C7285),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 14),
+                              Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                children: [
+                                  for (var index = 0; index < days.length; index++)
+                                    _DayPill(
+                                      label: days[index],
+                                      selected: a.repeatDays[index],
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              Wrap(
+                                spacing: 8,
+                                runSpacing: 8,
+                                children: [
+                                  _DifficultyChip(a.difficulty),
+                                  _SoundChip(a.sound),
+                                ],
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CalendarScreen extends StatefulWidget {
+  const CalendarScreen({
+    super.key,
+    required this.alarms,
+    required this.onAddAlarm,
+    required this.onEditAlarm,
+  });
+
+  final List<AlarmEntry> alarms;
+  final VoidCallback onAddAlarm;
+  final ValueChanged<AlarmEntry> onEditAlarm;
+
+  @override
+  State<CalendarScreen> createState() => _CalendarScreenState();
+}
+
+class _CalendarScreenState extends State<CalendarScreen> {
+  DateTime _displayMonth = DateTime.now();
+  DateTime _selectedDate = DateTime.now();
+
+  void _prevMonth() {
+    setState(() {
+      _displayMonth = DateTime(_displayMonth.year, _displayMonth.month - 1, 1);
+    });
+  }
+
+  void _nextMonth() {
+    setState(() {
+      _displayMonth = DateTime(_displayMonth.year, _displayMonth.month + 1, 1);
+    });
+  }
+
+  int _dayIndexFor(DateTime date) => date.weekday == DateTime.sunday ? 0 : date.weekday;
+
+  @override
+  Widget build(BuildContext context) {
+    final firstDayOfMonth = DateTime(_displayMonth.year, _displayMonth.month, 1);
+    final offset = firstDayOfMonth.weekday % 7; // Sunday-first
+    final daysInMonth = DateTime(_displayMonth.year, _displayMonth.month + 1, 0).day;
+
+    final months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    final selectedDateLabel = '${_selectedDate.day} ${months[_selectedDate.month - 1]} ${_selectedDate.year}';
+    final selectedDayIndex = _dayIndexFor(_selectedDate);
+    final selectedAlarms = widget.alarms.where((alarm) => alarm.repeatDays[selectedDayIndex]).toList();
+
+    return SafeArea(
+      bottom: false,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF8738F2), Color(0xFF5B33F5)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.only(
+                bottomLeft: Radius.circular(24),
+                bottomRight: Radius.circular(24),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.calendar_month_outlined, color: Colors.white, size: 30),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Calendar',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(14, 14, 14, 104),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(18),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.04),
+                          blurRadius: 14,
+                          offset: const Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            IconButton(onPressed: _prevMonth, icon: const Icon(Icons.chevron_left)),
+                            Expanded(
+                              child: Center(
+                                child: Text(
+                                  '${months[_displayMonth.month - 1]} ${_displayMonth.year}',
+                                  style: const TextStyle(fontWeight: FontWeight.w700),
+                                ),
+                              ),
+                            ),
+                            IconButton(onPressed: _nextMonth, icon: const Icon(Icons.chevron_right)),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: const [
+                            Text('Su', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('Mo', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('Tu', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('We', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('Th', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('Fr', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                            Text('Sa', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        for (var week = 0; week < 6; week++)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Row(
+                              children: List.generate(7, (dayIdx) {
+                                final index = week * 7 + dayIdx;
+                                final dayNumber = index - offset + 1;
+                                if (dayNumber < 1 || dayNumber > daysInMonth) {
+                                  return const Expanded(child: SizedBox(height: 42));
+                                }
+
+                                final date = DateTime(_displayMonth.year, _displayMonth.month, dayNumber);
+                                final isSelected = date.year == _selectedDate.year && date.month == _selectedDate.month && date.day == _selectedDate.day;
+                                final isToday = date.year == DateTime.now().year && date.month == DateTime.now().month && date.day == DateTime.now().day;
+                                final dayIndex = _dayIndexFor(date);
+                                final hasEvent = widget.alarms.any((a) => a.repeatDays[dayIndex]);
+
+                                return Expanded(
+                                  child: GestureDetector(
+                                    onTap: () => setState(() => _selectedDate = date),
+                                    child: Container(
+                                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                                      height: 42,
+                                      decoration: BoxDecoration(
+                                        color: isSelected
+                                            ? const Color(0xFF5B33F5)
+                                            : isToday
+                                                ? const Color(0xFFF2EFFF)
+                                                : Colors.transparent,
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                      alignment: Alignment.center,
+                                      child: Stack(
+                                        alignment: Alignment.center,
+                                        children: [
+                                          Text(
+                                            dayNumber.toString(),
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              fontWeight: FontWeight.w600,
+                                              color: isSelected ? Colors.white : const Color(0xFF2F3140),
+                                            ),
+                                          ),
+                                          if (hasEvent)
+                                            Positioned(
+                                              bottom: 6,
+                                              child: Container(
+                                                width: 5,
+                                                height: 5,
+                                                decoration: BoxDecoration(
+                                                  color: isSelected ? Colors.white : const Color(0xFF5B33F5),
+                                                  shape: BoxShape.circle,
+                                                ),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Schedule',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.black.withValues(alpha: 0.90),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Reminders for $selectedDateLabel',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF6C7285),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  if (selectedAlarms.isEmpty)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: const Text('No reminders for this date.'),
+                    )
+                  else
+                    Column(
+                      children: selectedAlarms.map((alarm) {
+                        final time = _formatAlarmTime(alarm.timeOfDay);
+                        return Container(
+                          width: double.infinity,
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: alarm.enabled
+                                ? Colors.white
+                                : const Color(0xFFF6F7FB),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(
+                              color: alarm.enabled
+                                  ? const Color(0xFFE9EAF1)
+                                  : const Color(0xFFE3E6F2),
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 48,
+                                height: 48,
+                                decoration: BoxDecoration(
+                                  color: alarm.enabled
+                                      ? const Color(0xFFE42E63)
+                                      : const Color(0xFFD8DCE8),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Icon(
+                                  Icons.alarm,
+                                  color: alarm.enabled ? Colors.white : const Color(0xFF8A90A3),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      alarm.label.isEmpty ? 'Alarm' : alarm.label,
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w700,
+                                        color: alarm.enabled
+                                            ? const Color(0xFF2F3140)
+                                            : const Color(0xFF8A90A3),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '${time.hour}:${time.minute} ${time.period}',
+                                      style: const TextStyle(
+                                        fontSize: 12,
+                                        color: Color(0xFF6C7285),
+                                      ),
+                                    ),
+                                    if (!alarm.enabled) ...[
+                                      const SizedBox(height: 4),
+                                      const Text(
+                                        'Off',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: Color(0xFFE11D48),
+                                        ),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: () => widget.onEditAlarm(alarm),
+                                icon: const Icon(Icons.edit_outlined),
+                                tooltip: 'Edit alarm',
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: FilledButton(
+                      onPressed: widget.onAddAlarm,
+                      child: const Text('Set schedule'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class NotesCalendarScreen extends StatefulWidget {
+  const NotesCalendarScreen({super.key});
+
+  @override
+  State<NotesCalendarScreen> createState() => _NotesCalendarScreenState();
+}
+
+class _NotesCalendarScreenState extends State<NotesCalendarScreen> {
+  DateTime _displayMonth = DateTime.now();
+  DateTime _selectedDate = DateUtils.dateOnly(DateTime.now());
+  bool _loading = true;
+  final List<ScheduleEntry> _schedules = [];
+
+  static const List<String> _months = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSchedules();
+  }
+
+  Future<void> _loadSchedules() async {
+    final loadedSchedules = await ScheduleStorage.instance.loadSchedules();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _schedules
+        ..clear()
+        ..addAll(loadedSchedules);
+      _loading = false;
+    });
+  }
+
+  Future<void> _saveSchedules() async {
+    await ScheduleStorage.instance.saveSchedules(_schedules);
+  }
+
+  Future<void> _openCreateSchedule() async {
+    final created = await Navigator.of(context).push<ScheduleEntry>(
+      MaterialPageRoute(builder: (_) => const ScheduleEditorScreen()),
+    );
+
+    if (created == null) {
+      return;
+    }
+
+    setState(() {
+      _schedules.insert(0, created);
+      _selectedDate = DateUtils.dateOnly(created.date);
+      _displayMonth = DateTime(created.date.year, created.date.month, 1);
+    });
+
+    await _saveSchedules();
+  }
+
+  Future<void> _openEditSchedule(ScheduleEntry schedule) async {
+    final updated = await Navigator.of(context).push<ScheduleEntry>(
+      MaterialPageRoute(builder: (_) => ScheduleEditorScreen(initialSchedule: schedule)),
+    );
+
+    if (updated == null) {
+      return;
+    }
+
+    setState(() {
+      final index = _schedules.indexWhere((entry) => entry.id == updated.id);
+      if (index >= 0) {
+        _schedules[index] = updated;
+      }
+      _selectedDate = DateUtils.dateOnly(updated.date);
+      _displayMonth = DateTime(updated.date.year, updated.date.month, 1);
+    });
+
+    await _saveSchedules();
+  }
+
+  void _prevMonth() {
+    setState(() {
+      _displayMonth = DateTime(_displayMonth.year, _displayMonth.month - 1, 1);
+    });
+  }
+
+  void _nextMonth() {
+    setState(() {
+      _displayMonth = DateTime(_displayMonth.year, _displayMonth.month + 1, 1);
+    });
+  }
+
+  List<ScheduleEntry> _selectedSchedules() {
+    final selected = DateUtils.dateOnly(_selectedDate);
+    final result = _schedules.where((schedule) => DateUtils.isSameDay(schedule.date, selected)).toList();
+    // Sort by priority (enum order: veryImportant first) then by start time
+    result.sort((a, b) {
+      final p = a.priority.index.compareTo(b.priority.index);
+      if (p != 0) return p;
+      final aMinutes = a.startTime.hour * 60 + a.startTime.minute;
+      final bMinutes = b.startTime.hour * 60 + b.startTime.minute;
+      return aMinutes.compareTo(bMinutes);
+    });
+    return result;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        body: SafeArea(child: Center(child: CircularProgressIndicator())),
+      );
+    }
+
+    final firstDayOfMonth = DateTime(_displayMonth.year, _displayMonth.month, 1);
+    final offset = firstDayOfMonth.weekday % 7;
+    final daysInMonth = DateTime(_displayMonth.year, _displayMonth.month + 1, 0).day;
+    final selectedSchedules = _selectedSchedules();
+    final selectedDateLabel = '${_selectedDate.day} ${_months[_selectedDate.month - 1]} ${_selectedDate.year}';
+
+    return SafeArea(
+      bottom: false,
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF8738F2), Color(0xFF5B33F5)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.only(
+                bottomLeft: Radius.circular(24),
+                bottomRight: Radius.circular(24),
+              ),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.calendar_month_outlined, color: Colors.white, size: 30),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Calendar',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(14, 14, 14, 104),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF3F4FF),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Select Date:',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(18),
+                            border: Border.all(color: const Color(0xFFE2E4EF)),
+                          ),
+                          child: Column(
+                            children: [
+                              Row(
+                                children: [
+                                  IconButton(onPressed: _prevMonth, icon: const Icon(Icons.chevron_left)),
+                                  DropdownButtonHideUnderline(
+                                    child: DropdownButton<String>(
+                                      value: _months[_displayMonth.month - 1],
+                                      items: _months
+                                          .map((month) => DropdownMenuItem(value: month, child: Text(month)))
+                                          .toList(),
+                                      onChanged: (value) {
+                                        if (value == null) return;
+                                        final monthIndex = _months.indexOf(value) + 1;
+                                        setState(() {
+                                          _displayMonth = DateTime(_displayMonth.year, monthIndex, 1);
+                                        });
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  DropdownButtonHideUnderline(
+                                    child: DropdownButton<int>(
+                                      value: _displayMonth.year,
+                                      items: List.generate(11, (index) => 2020 + index)
+                                          .map((year) => DropdownMenuItem(value: year, child: Text(year.toString())))
+                                          .toList(),
+                                      onChanged: (value) {
+                                        if (value == null) return;
+                                        setState(() {
+                                          _displayMonth = DateTime(value, _displayMonth.month, 1);
+                                        });
+                                      },
+                                    ),
+                                  ),
+                                  const Spacer(),
+                                  IconButton(onPressed: _nextMonth, icon: const Icon(Icons.chevron_right)),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: const [
+                                  Text('Su', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('Mo', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('Tu', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('We', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('Th', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('Fr', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                  Text('Sa', style: TextStyle(fontSize: 12, color: Color(0xFF848A9B))),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              for (var week = 0; week < 6; week++)
+                                Padding(
+                                  padding: const EdgeInsets.only(bottom: 6),
+                                  child: Row(
+                                    children: List.generate(7, (dayIdx) {
+                                      final index = week * 7 + dayIdx;
+                                      final dayNumber = index - offset + 1;
+                                      if (dayNumber < 1 || dayNumber > daysInMonth) {
+                                        return const Expanded(child: SizedBox(height: 42));
+                                      }
+
+                                      final date = DateTime(_displayMonth.year, _displayMonth.month, dayNumber);
+                                      final isSelected = DateUtils.isSameDay(date, _selectedDate);
+                                      final isToday = DateUtils.isSameDay(date, DateTime.now());
+                                      final hasEvent = _schedules.any((schedule) => DateUtils.isSameDay(schedule.date, date));
+
+                                      return Expanded(
+                                        child: GestureDetector(
+                                          onTap: () => setState(() => _selectedDate = date),
+                                          child: Container(
+                                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                                            height: 42,
+                                            decoration: BoxDecoration(
+                                              color: isSelected
+                                                  ? const Color(0xFF5B33F5)
+                                                  : isToday
+                                                      ? const Color(0xFFF2EFFF)
+                                                      : Colors.transparent,
+                                              borderRadius: BorderRadius.circular(10),
+                                            ),
+                                            alignment: Alignment.center,
+                                            child: Stack(
+                                              alignment: Alignment.center,
+                                              children: [
+                                                Text(
+                                                  dayNumber.toString(),
+                                                  style: TextStyle(
+                                                    fontSize: 13,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: isSelected ? Colors.white : const Color(0xFF2F3140),
+                                                  ),
+                                                ),
+                                                if (hasEvent)
+                                                  Positioned(
+                                                    bottom: 6,
+                                                    child: Container(
+                                                      width: 5,
+                                                      height: 5,
+                                                      decoration: BoxDecoration(
+                                                        color: isSelected ? Colors.white : const Color(0xFF5B33F5),
+                                                        shape: BoxShape.circle,
+                                                      ),
+                                                    ),
+                                                  ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    }),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    'Schedule',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.black.withValues(alpha: 0.90),
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Reminders for $selectedDateLabel',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF6C7285)),
+                  ),
+                  const SizedBox(height: 10),
+                  if (selectedSchedules.isEmpty)
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: const Text('No notes or schedules for this date.'),
+                    )
+                  else
+                    Column(
+                      children: selectedSchedules.map((schedule) {
+                        final start = _formatAlarmTime(schedule.startTime);
+                        final end = _formatAlarmTime(schedule.endTime);
+                        final priorityColor = schedule.priority.color;
+
+                        return Container(
+                          width: double.infinity,
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: priorityColor.withValues(alpha: 0.14),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: priorityColor.withValues(alpha: 0.45)),
+                          ),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                width: 52,
+                                height: 52,
+                                decoration: BoxDecoration(
+                                  color: priorityColor,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Icon(Icons.event_note, color: Colors.white, size: 24),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Expanded(
+                                          child: Text(
+                                            schedule.title,
+                                            style: const TextStyle(
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                          decoration: BoxDecoration(
+                                            color: priorityColor.withValues(alpha: 0.18),
+                                            borderRadius: BorderRadius.circular(999),
+                                          ),
+                                          child: Text(
+                                            schedule.priority.label,
+                                            style: TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              color: priorityColor,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      '${start.hour}:${start.minute} ${start.period} - ${end.hour}:${end.minute} ${end.period}',
+                                      style: const TextStyle(fontSize: 12, color: Color(0xFF2F3140)),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      schedule.description,
+                                      style: const TextStyle(fontSize: 12, color: Color(0xFF515767)),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                onPressed: () => _openEditSchedule(schedule),
+                                icon: const Icon(Icons.edit_outlined),
+                                tooltip: 'Edit schedule',
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  const SizedBox(height: 10),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 52,
+                    child: FilledButton(
+                      onPressed: _openCreateSchedule,
+                      child: const Text('Set schedule'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ScheduleEditorScreen extends StatefulWidget {
+  const ScheduleEditorScreen({super.key, this.initialSchedule});
+
+  final ScheduleEntry? initialSchedule;
+
+  @override
+  State<ScheduleEditorScreen> createState() => _ScheduleEditorScreenState();
+}
+
+class _ScheduleEditorScreenState extends State<ScheduleEditorScreen> {
+  late DateTime _selectedDate;
+  late int _startHour;
+  late int _startMinute;
+  late bool _startIsPm;
+  late int _endHour;
+  late int _endMinute;
+  late bool _endIsPm;
+  late final TextEditingController _titleController;
+  late final TextEditingController _descriptionController;
+  late SchedulePriority _priority;
+  
+
+  @override
+  void initState() {
+    super.initState();
+    final initial = widget.initialSchedule;
+    final now = DateTime.now();
+    final defaultStart = TimeOfDay.fromDateTime(now);
+    final defaultEnd = TimeOfDay.fromDateTime(now.add(const Duration(hours: 1)));
+
+    _selectedDate = DateUtils.dateOnly(initial?.date ?? DateTime.now());
+    _startHour = _displayHour((initial?.startTime ?? defaultStart).hour);
+    _startMinute = (initial?.startTime ?? defaultStart).minute;
+    _startIsPm = (initial?.startTime ?? defaultStart).period == DayPeriod.pm;
+    _endHour = _displayHour((initial?.endTime ?? defaultEnd).hour);
+    _endMinute = (initial?.endTime ?? defaultEnd).minute;
+    _endIsPm = (initial?.endTime ?? defaultEnd).period == DayPeriod.pm;
+    _titleController = TextEditingController(text: initial?.title ?? '');
+    _descriptionController = TextEditingController(text: initial?.description ?? '');
+    _priority = initial?.priority ?? SchedulePriority.other;
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickDate() async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _selectedDate,
+      firstDate: DateTime.now().subtract(const Duration(days: 365)),
+      lastDate: DateTime.now().add(const Duration(days: 365 * 5)),
+    );
+
+    if (picked != null) {
+      setState(() {
+        _selectedDate = DateUtils.dateOnly(picked);
+      });
+    }
+  }
+
+  Future<void> _save() async {
+    final title = _titleController.text.trim();
+    final description = _descriptionController.text.trim();
+    if (title.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enter a schedule title.')),
+      );
+      return;
+    }
+
+    final startMinutes = _normalizeHour(_startHour, _startIsPm) * 60 + _startMinute;
+    final endMinutes = _normalizeHour(_endHour, _endIsPm) * 60 + _endMinute;
+    if (endMinutes <= startMinutes) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('End time must be after start time.')),
+      );
+      return;
+    }
+
+    final schedule = ScheduleEntry(
+      id: widget.initialSchedule?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
+      date: _selectedDate,
+      startTime: TimeOfDay(hour: _normalizeHour(_startHour, _startIsPm), minute: _startMinute),
+      endTime: TimeOfDay(hour: _normalizeHour(_endHour, _endIsPm), minute: _endMinute),
+      title: title,
+      description: description,
+      priority: _priority,
+    );
+
+    if (!mounted) return;
+    Navigator.of(context).pop(schedule);
+  }
+
+  Widget _priorityButton(SchedulePriority priority) {
+    final selected = _priority == priority;
+    final color = priority.color;
+
+    return InkWell(
+      onTap: () => setState(() => _priority = priority),
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: selected ? color.withValues(alpha: 0.18) : color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: selected ? color : Colors.transparent),
+        ),
         child: Text(
-          'Calendar \nwill be added next. \n Di pa maintindihan paano ito \n pati yung notification at background running',
-          textAlign: TextAlign.center,
+          priority.label,
           style: TextStyle(
-            fontSize: 18,
-            fontWeight: FontWeight.w600,
-            color: Color(0xFF4C5060),
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: color,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _priorityPill(SchedulePriority priority, {bool wide = false}) {
+    final selected = _priority == priority;
+    final color = priority.color;
+    final borderColor = selected ? const Color(0xFF5B33F5) : Colors.transparent;
+
+    return InkWell(
+      onTap: () => setState(() => _priority = priority),
+      borderRadius: BorderRadius.circular(999),
+      child: Container(
+        width: wide ? 160 : null,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+        decoration: BoxDecoration(
+          color: selected ? color.withValues(alpha: 0.12) : Colors.white,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: borderColor, width: selected ? 2 : 1),
+          boxShadow: selected
+              ? [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 8, offset: const Offset(0, 4))]
+              : [],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              priority.label,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: selected ? const Color(0xFF2F3140) : const Color(0xFF2F3140),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isEditing = widget.initialSchedule != null;
+    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    return Scaffold(
+      appBar: AppBar(
+        leading: IconButton(
+          onPressed: () => Navigator.of(context).pop(),
+          icon: const Icon(Icons.arrow_back_ios_new_rounded),
+        ),
+        title: Text(
+          isEditing ? 'Edit Schedule' : 'New Schedule',
+          style: const TextStyle(fontWeight: FontWeight.w800),
+        ),
+      ),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 104),
+          child: Column(
+            children: [
+              _SectionCard(
+                title: 'Select Date',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.tonal(
+                        onPressed: _pickDate,
+                        child: Text(
+                          '${_selectedDate.day} ${monthNames[_selectedDate.month - 1]} ${_selectedDate.year}',
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _SectionCard(
+                title: 'Select Time',
+                child: Column(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF8F9FC),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFE2E4EF)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text(
+                                'From',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF2F3140),
+                                ),
+                              ),
+                              Text(
+                                '${_startHour.toString().padLeft(2, '0')}:${_startMinute.toString().padLeft(2, '0')} ${_startIsPm ? 'PM' : 'AM'}',
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF5B33F5),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              _ScrollableNumberPicker(
+                                value: _startHour,
+                                minValue: 1,
+                                maxValue: 12,
+                                onChanged: (value) => setState(() => _startHour = value),
+                              ),
+                              const SizedBox(width: 8),
+                              const Text(':', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700)),
+                              const SizedBox(width: 8),
+                              _ScrollableNumberPicker(
+                                value: _startMinute,
+                                minValue: 0,
+                                maxValue: 59,
+                                onChanged: (value) => setState(() => _startMinute = value),
+                              ),
+                              const SizedBox(width: 12),
+                              Column(
+                                children: [
+                                  _PeriodButton(
+                                    label: 'AM',
+                                    selected: !_startIsPm,
+                                    onTap: () => setState(() => _startIsPm = false),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  _PeriodButton(
+                                    label: 'PM',
+                                    selected: _startIsPm,
+                                    onTap: () => setState(() => _startIsPm = true),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF8F9FC),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: const Color(0xFFE2E4EF)),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              const Text(
+                                'To',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF2F3140),
+                                ),
+                              ),
+                              Text(
+                                '${_endHour.toString().padLeft(2, '0')}:${_endMinute.toString().padLeft(2, '0')} ${_endIsPm ? 'PM' : 'AM'}',
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFF5B33F5),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              _ScrollableNumberPicker(
+                                value: _endHour,
+                                minValue: 1,
+                                maxValue: 12,
+                                onChanged: (value) => setState(() => _endHour = value),
+                              ),
+                              const SizedBox(width: 8),
+                              const Text(':', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w700)),
+                              const SizedBox(width: 8),
+                              _ScrollableNumberPicker(
+                                value: _endMinute,
+                                minValue: 0,
+                                maxValue: 59,
+                                onChanged: (value) => setState(() => _endMinute = value),
+                              ),
+                              const SizedBox(width: 12),
+                              Column(
+                                children: [
+                                  _PeriodButton(
+                                    label: 'AM',
+                                    selected: !_endIsPm,
+                                    onTap: () => setState(() => _endIsPm = false),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  _PeriodButton(
+                                    label: 'PM',
+                                    selected: _endIsPm,
+                                    onTap: () => setState(() => _endIsPm = true),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _SectionCard(
+                title: 'Note Title',
+                child: TextField(
+                  controller: _titleController,
+                  decoration: const InputDecoration(
+                    hintText: 'Title here',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              _SectionCard(
+                title: 'Note Description',
+                child: TextField(
+                  controller: _descriptionController,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    hintText: 'Description here',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ),
+              const SizedBox.shrink(),
+              _SectionCard(
+                title: 'Priority/Importance',
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Left column: main priority options (stacked)
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _priorityPill(SchedulePriority.veryImportant),
+                          const SizedBox(height: 8),
+                          _priorityPill(SchedulePriority.semiImportant),
+                          const SizedBox(height: 8),
+                          _priorityPill(SchedulePriority.leastImportant),
+                          const SizedBox(height: 8),
+                          _priorityPill(SchedulePriority.optional),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 18),
+                    // Right column: single 'Other' pill (no plus button)
+                    Column(
+                      children: [
+                        _priorityPill(SchedulePriority.other, wide: true),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      bottomNavigationBar: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+          child: SizedBox(
+            height: 52,
+            width: double.infinity,
+            child: FilledButton(
+              onPressed: _save,
+              child: Icon(isEditing ? Icons.edit : Icons.add_circle_outline, size: 26),
+            ),
           ),
         ),
       ),
@@ -1626,7 +3174,7 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
     super.initState();
     final initial = widget.initialAlarm;
     final timeOfDay =
-        initial?.timeOfDay ?? const TimeOfDay(hour: 7, minute: 30);
+      initial?.timeOfDay ?? TimeOfDay.fromDateTime(DateTime.now());
 
     _hour = _displayHour(timeOfDay.hour);
     _minute = timeOfDay.minute;
@@ -1976,9 +3524,8 @@ class _AlarmEditorScreenState extends State<AlarmEditorScreen> {
   }
 }
 
-// ignore: unused_element_parameter
 class _SectionCard extends StatelessWidget {
-  const _SectionCard({super.key, this.title, required this.child});
+  const _SectionCard({this.title, required this.child});
 
   final String? title;
   final Widget child;
